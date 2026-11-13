@@ -61,6 +61,7 @@ Modules
    modules/intro
    modules/crossref
    modules/worksquery
+   modules/scopes
    modules/workscontainer
    modules/filters
    modules/counts
@@ -74,6 +75,9 @@ Modules
 
 :doc:`modules/worksquery`
     The WorksQuery class: querying works from Crossref.
+
+:doc:`modules/scopes`
+    The ScopeCollection class: merging works from several scopes.
 
 :doc:`modules/workscontainer`
     The WorksContainer class: working with works :p

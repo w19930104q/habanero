@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import copy
 from collections.abc import Iterable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx2
 
 from ..request_class import Request
 from .crossref import Crossref
+
+if TYPE_CHECKING:
+    from .scopes import ScopeCollection
 
 
 class WorksQuery(Iterable[dict[str, Any]]):
@@ -66,6 +71,25 @@ class WorksQuery(Iterable[dict[str, Any]]):
       base = WorksQuery(cr).query("zika").filters(from_pub_date="2020")
       base.sort("published").order("asc")
       base.sort("published").order("desc")
+
+    **Merging several scopes**
+
+    :meth:`union` (or :class:`~habanero.ScopeCollection`) combines several
+    independent queries — e.g. one journal, one member and one funder scope —
+    into one literature list. Each branch keeps its own conditions and
+    cursor, DOIs are merged case-insensitively (first occurrence supplies
+    the primary metadata, later hits keep their differing top-level fields
+    and full provenance), records without a DOI stay independent, and
+    failed branches are reported explicitly::
+
+      merged = WorksQuery.union(
+          {
+              "journal": WorksQuery(cr).journals("2167-8359").cursor("*"),
+              "member": WorksQuery(cr).members(98).cursor("*"),
+              "funder": WorksQuery(cr).funders("10.13039/100000001"),
+          }
+      ).execute()
+      [work.scopes for work in merged]  # which scope(s) found each work
     """
 
     def __init__(self, cr: Crossref | None = None):
@@ -92,37 +116,37 @@ class WorksQuery(Iterable[dict[str, Any]]):
         clone._result = None  # fresh clone shouldn't inherit cached results
         return clone
 
-    def journals(self, ids=None) -> "WorksQuery":
+    def journals(self, ids=None) -> WorksQuery:
         clone = self._clone()
         clone._endpoint = "journals"
         clone._ids = ids
         return clone
 
-    def members(self, ids=None) -> "WorksQuery":
+    def members(self, ids=None) -> WorksQuery:
         clone = self._clone()
         clone._endpoint = "members"
         clone._ids = ids
         return clone
 
-    def funders(self, ids=None) -> "WorksQuery":
+    def funders(self, ids=None) -> WorksQuery:
         clone = self._clone()
         clone._endpoint = "funders"
         clone._ids = ids
         return clone
 
-    def prefixes(self, ids=None) -> "WorksQuery":
+    def prefixes(self, ids=None) -> WorksQuery:
         clone = self._clone()
         clone._endpoint = "prefixes"
         clone._ids = ids
         return clone
 
-    def types(self, ids=None) -> "WorksQuery":
+    def types(self, ids=None) -> WorksQuery:
         clone = self._clone()
         clone._endpoint = "types"
         clone._ids = ids
         return clone
 
-    def query(self, q: str | None = None, **kwargs) -> "WorksQuery":
+    def query(self, q: str | None = None, **kwargs) -> WorksQuery:
         updates = {}
         if q:
             updates["query"] = q
@@ -130,29 +154,68 @@ class WorksQuery(Iterable[dict[str, Any]]):
             updates[f"query_{k}"] = v
         return self._clone(**updates)
 
-    def filters(self, **kwargs) -> "WorksQuery":
+    def filters(self, **kwargs) -> WorksQuery:
         new_filters = {**self._params.get("filters", {}), **kwargs}
         return self._clone(filters=new_filters)
 
-    def sort(self, field: str) -> "WorksQuery":
+    def sort(self, field: str) -> WorksQuery:
         return self._clone(sort=field)
 
-    def order(self, direction: str) -> "WorksQuery":
+    def order(self, direction: str) -> WorksQuery:
         return self._clone(order=direction)
 
-    def select(self, *fields: str) -> "WorksQuery":
+    def select(self, *fields: str) -> WorksQuery:
         return self._clone(select=list(fields))
 
-    def facet(self, name: str, count: int) -> "WorksQuery":
+    def facet(self, name: str, count: int) -> WorksQuery:
         existing = self._params.get("facet")
         new_facet = f"{existing},{name}:{count}" if existing else f"{name}:{count}"
         return self._clone(facet=new_facet)
 
-    def limit(self, n: int) -> "WorksQuery":
+    def limit(self, n: int) -> WorksQuery:
         return self._clone(limit=n)
 
-    def cursor(self, value: str = "*", cursor_max: int | None = 5000) -> "WorksQuery":
+    def cursor(self, value: str = "*", cursor_max: int | None = 5000) -> WorksQuery:
         return self._clone(cursor=value, cursor_max=cursor_max)
+
+    @classmethod
+    def union(
+        cls,
+        branches: dict[str, WorksQuery] | Iterable[tuple[str, WorksQuery]],
+        on_error: str = "collect",
+    ) -> ScopeCollection:
+        """Build a composable multi-scope collection from several queries.
+
+        Every branch keeps its own query conditions, endpoint, ids and
+        cursor; the branches and their results never share state. The
+        collection merges the branches' records by DOI
+        (case-insensitive, first occurrence wins), keeps records without a
+        DOI independently, records every hit's source (endpoint, scope id,
+        page and index), and reports failed branches explicitly instead of
+        pretending they returned zero hits.
+
+        :param branches: a mapping of branch labels to :class:`WorksQuery`
+            instances, or an iterable of ``(label, query)`` pairs
+        :param on_error: ``"collect"`` (default) keeps going and reports
+            failing branches on the result; ``"raise"`` propagates the
+            first error
+        :rtype: :class:`ScopeCollection`
+
+        Usage::
+
+          merged = WorksQuery.union(
+              {
+                  "journal": WorksQuery(cr).journals("2167-8359").cursor("*"),
+                  "member": WorksQuery(cr).members(98).cursor("*"),
+                  "funder": WorksQuery(cr).funders("10.13039/100000001"),
+              }
+          ).execute()
+          for work in merged:
+              print(work.doi, work.scopes, len(work.sources))
+        """
+        from .scopes import ScopeCollection
+
+        return ScopeCollection(branches, on_error=on_error)
 
     @property
     def url(self) -> str:
