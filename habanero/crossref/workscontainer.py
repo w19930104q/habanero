@@ -1,3 +1,6 @@
+from .collect import CollectResult, SourceResult
+
+
 class WorksContainer:
     """
     WorksContainer: Class for working with works results
@@ -35,18 +38,55 @@ class WorksContainer:
             x.license
             x.title
             x.abstract
+
+    A :class:`~habanero.CollectResult` from :meth:`WorksQuery.collect` is also
+    accepted, including an all-empty one (every source returned zero works).
+    Works stay ordered by source input position, page, and item, and the
+    source association is retained in parallel lists::
+
+            result = WorksQuery(cr).members(["12", "34"]).collect()
+            x = WorksContainer(result)
+            x.works          # all works across both sources, ordered
+            x.source_ids     # source ID per work, aligned with x.works
+            x.source_pages   # 1-based page number per work
+            x.source_indexes # input position of the source per work
+            x.sources        # the SourceResult objects, in input order
     """
 
     def __init__(self, data) -> None:
         super().__init__()
-        if not data:
-            raise ValueError("data len must be > zero")
-        self.__data = data
-        self.works = self.works_handler(self.__data)
-        keys = list(self.works[0].keys())
+        if isinstance(data, CollectResult):
+            self.__data = data
+            collect = True
+            self.works = [work for source in data.sources for work in source.works]
+        else:
+            if not data:
+                raise ValueError("data len must be > zero")
+            self.__data = data
+            collect = False
+            self.works = self.works_handler(self.__data)
+        keys = list(self.works[0].keys()) if self.works else []
         for key in keys:
             values = [work.get(key, None) for work in self.works]
             setattr(self, key.lower().replace("-", "_"), values)
+        if collect:
+            # set provenance last so a work field can never clobber it
+            self.sources: list[SourceResult] = list(data.sources)
+            self.source_indexes = [
+                prov["source_index"]
+                for source in data.sources
+                for prov in source.provenance()
+            ]
+            self.source_ids = [
+                prov["source_id"]
+                for source in data.sources
+                for prov in source.provenance()
+            ]
+            self.source_pages = [
+                prov["page"] for source in data.sources for prov in source.provenance()
+            ]
+        else:
+            self.sources = []
 
     def __repr__(self) -> str:
         return f"""<{type(self).__name__}: No. works: {len(self.works)}>"""

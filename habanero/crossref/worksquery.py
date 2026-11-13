@@ -1,11 +1,25 @@
 import copy
+import math
+import warnings
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from typing import Any
+from unittest.mock import patch
 
 import httpx2
 
 from ..request_class import Request
+from .collect import (
+    STATUS_COMPLETE,
+    STATUS_CURSOR_MAX,
+    STATUS_FAILED,
+    CollectResult,
+    SourceResult,
+)
 from .crossref import Crossref
+
+#: source routes that support ``/<endpoint>/<id>/works`` and thus collect()
+COLLECT_ENDPOINTS = ("members", "funders", "journals", "prefixes", "types")
 
 
 class WorksQuery(Iterable[dict[str, Any]]):
@@ -238,3 +252,201 @@ class WorksQuery(Iterable[dict[str, Any]]):
                 )
             self._result = result
         return self._result
+
+    # --- collect -----------------------------------------------------------
+
+    def collect(self, warn: bool = False) -> CollectResult:
+        """Collect works for many source IDs, deep-paging each one.
+
+        The query must be scoped to a source route with IDs — one of
+        :meth:`members`, :meth:`funders`, :meth:`journals`, :meth:`prefixes`,
+        or :meth:`types`, each given one or more IDs — for example::
+
+            q = WorksQuery(cr).members(["12", "34", "12"]).limit(100)
+            result = q.collect()
+
+        Every ID is queried independently in input order: an ID that appears
+        twice produces two independent source results, and works sharing a
+        DOI across sources are never merged. Each source is deep-paged with a
+        cursor up to the query's ``cursor_max`` (default 5000; ``None`` means
+        no cap), reusing this query's filters, query terms, limit, select, and
+        so on.
+
+        Each source ends with one of three statuses:
+
+        * ``"complete"`` — every available page was retrieved; a source with
+          zero works is also complete
+        * ``"cursor_max"`` — paging stopped because ``cursor_max`` was reached
+          while more works existed, so the retained data is partial
+        * ``"failed"`` — a request failed; pages retrieved before the failure
+          are retained, together with the request URL, failed page number, and
+          error category. A failure never aborts the run; the remaining
+          sources are still collected.
+
+        :param warn: when ``True`` (default ``False``), an HTTP failure on a
+            page warns instead of raising and is recorded as a failed source;
+            the warning behavior matches :meth:`execute`. Retry behavior is
+            unchanged either way.
+        :returns: a :class:`CollectResult`; pass it straight to
+            :class:`WorksContainer`, which also accepts an all-empty result.
+        """
+        if self._endpoint not in COLLECT_ENDPOINTS:
+            raise ValueError(
+                "collect() requires a source query with IDs — call one of "
+                f"{', '.join(COLLECT_ENDPOINTS)} with ids before collect(); "
+                f"got endpoint {self._endpoint!r}"
+            )
+        ids = self._normalize_ids(self._ids)
+        if not ids:
+            raise ValueError(
+                "collect() requires at least one source ID; call "
+                f"{self._endpoint}() with ids before collect()"
+            )
+
+        cursor_max = self._params.get("cursor_max", 5000)
+        if cursor_max is not None and not isinstance(cursor_max, int):
+            raise TypeError("cursor_max must be of class int (or None for no cap)")
+
+        sources = [
+            self._collect_one(index, source_id, cursor_max, warn)
+            for index, source_id in enumerate(ids)
+        ]
+        return CollectResult(self._endpoint, sources)
+
+    @staticmethod
+    def _normalize_ids(ids) -> list:
+        if ids is None:
+            return []
+        if isinstance(ids, str):
+            return ids.split()
+        if isinstance(ids, int):
+            return [ids]
+        return list(ids)
+
+    def _build_collect_request(self, source_id, cursor_max) -> Request:
+        params = copy.deepcopy(self._params)
+        known = [
+            "query",
+            "filters",
+            "offset",
+            "limit",
+            "sample",
+            "sort",
+            "order",
+            "facet",
+            "select",
+            "cursor",
+            "cursor_max",
+        ]
+        kwargs = {k: v for k, v in params.items() if k not in known}
+        return Request(
+            self._cr.mailto,
+            self._cr.ua_string,
+            self._cr.timeout,
+            self._cr.base_url + f"/{self._endpoint}/",
+            "",
+            params.get("query"),
+            params.get("filters"),
+            params.get("offset"),
+            params.get("limit"),
+            params.get("sample"),
+            params.get("sort"),
+            params.get("order"),
+            params.get("facet"),
+            params.get("select"),
+            "*",
+            cursor_max,
+            None,
+            False,
+            client=self._cr._http,
+            **kwargs,
+        )
+
+    @staticmethod
+    @contextmanager
+    def _warn_recorder(records: list):
+        """Record warnings without swallowing them.
+
+        ``warnings.catch_warnings(record=True)`` would hide the warning from
+        outer ``pytest.warns`` (it replaces the showwarning on the
+        interpreter-wide manager), so wrap ``warnings.warn`` instead; the
+        original function is still called and existing warn behavior is
+        unchanged.
+        """
+        with patch.object(warnings, "warn", side_effect=warnings.warn) as mocked:
+            yield
+        records.extend(str(call.args[0]) for call in mocked.call_args_list)
+
+    def _collect_one(
+        self, source_index: int, source_id, cursor_max, should_warn: bool
+    ) -> SourceResult:
+        # build one Request and page it manually, mirroring Request.do_request
+        # / _redo_req exactly, so request shape, warn and retry behavior match
+        req = self._build_collect_request(source_id, cursor_max)
+        # base_url already ends with /<endpoint>/ (see _build_collect_request),
+        # so path is just <id>/works, exactly as request() builds it
+        req.path = f"{source_id}/works"
+        result = SourceResult(source_index, self._endpoint, source_id, req._url())
+
+        cap = math.inf if cursor_max is None else cursor_max
+        payload = None
+        try:
+            payload = req.payload()
+            warned: list[str] = []
+            with self._warn_recorder(warned):
+                js = req._req(payload=payload, should_warn=should_warn)
+            if js is None:
+                self._mark_http_failure(result, req, payload, warned)
+                return result
+
+            pages = [js]
+            total = len(js["message"]["items"])
+            cursor = js["message"].get("next-cursor")
+            max_avail = js["message"]["total-results"]
+            stopped_on_empty_page = False
+
+            while cursor is not None and cap > total and total < max_avail:
+                payload["cursor"] = cursor
+                page_warned: list[str] = []
+                with self._warn_recorder(page_warned):
+                    out = req._req(payload=payload, should_warn=should_warn)
+                if out is None:
+                    result.pages = pages
+                    self._mark_http_failure(result, req, payload, page_warned)
+                    return result
+                items = out["message"]["items"]
+                if not items:
+                    # an empty page can still carry a next-cursor; stop rather
+                    # than loop forever (matches Request._redo_req)
+                    stopped_on_empty_page = True
+                    break
+                cursor = out["message"].get("next-cursor")
+                pages.append(out)
+                total += len(items)
+
+            result.pages = pages
+            hit_cap = not stopped_on_empty_page and cursor is not None and cap <= total
+            result.status = STATUS_CURSOR_MAX if hit_cap else STATUS_COMPLETE
+            return result
+        except Exception as e:  # noqa: BLE001 - recorded per source, run continues
+            result.status = STATUS_FAILED
+            result.failed_page = len(result.pages) + 1
+            result.failed_url = self._request_url(req, payload)
+            result.error_type = type(e).__name__
+            result.error_message = str(e) or repr(e)
+            return result
+
+    @staticmethod
+    def _mark_http_failure(result: SourceResult, req: Request, payload, warned):
+        result.status = STATUS_FAILED
+        result.failed_page = len(result.pages) + 1
+        result.failed_url = str(httpx2.Request("GET", req._url(), params=payload).url)
+        result.error_type = "HTTPStatusError"
+        result.error_message = warned[-1] if warned else "HTTP request failed"
+
+    @staticmethod
+    def _request_url(req: Request, payload) -> str:
+        try:
+            return str(httpx2.Request("GET", req._url(), params=payload).url)
+        except Exception:  # noqa: BLE001 - best-effort URL for the error record
+            return req._url()

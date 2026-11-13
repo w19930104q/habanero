@@ -38,13 +38,29 @@ __license__ = "MIT"
 
 from .cn import content_negotiation, csl_styles
 from .counts import citation_count
-from .crossref import Crossref, WorksContainer, WorksQuery
+from .crossref import (
+    COLLECT_ENDPOINTS,
+    STATUS_COMPLETE,
+    STATUS_CURSOR_MAX,
+    STATUS_FAILED,
+    CollectResult,
+    Crossref,
+    SourceResult,
+    WorksContainer,
+    WorksQuery,
+)
 from .exceptions import Error, RequestError
 
 __all__ = [
+    "COLLECT_ENDPOINTS",
+    "STATUS_COMPLETE",
+    "STATUS_CURSOR_MAX",
+    "STATUS_FAILED",
+    "CollectResult",
     "Crossref",
     "Error",
     "RequestError",
+    "SourceResult",
     "WorksContainer",
     "WorksQuery",
     "citation_count",
